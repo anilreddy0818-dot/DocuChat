@@ -1,0 +1,318 @@
+
+import os
+import re
+
+import streamlit as st
+from dotenv import load_dotenv
+from groq import Groq
+from openai import OpenAI
+from google import genai
+
+# Load local .env settings when running on your computer.
+load_dotenv()
+
+
+def get_setting(name: str, default=None):
+    """
+    Read configuration from local environment variables first,
+    then from Streamlit Cloud Secrets.
+    """
+    value = os.getenv(name)
+
+    if value:
+        return value
+
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+def quick_answer(question: str, passages: list[dict]) -> str:
+    """Extract relevant sentences locally without an AI API."""
+
+    if not passages:
+        return "I couldn't find relevant information in this PDF."
+
+    stop_words = {
+        "what", "when", "where", "which", "who", "why", "how",
+        "the", "is", "are", "was", "were", "a", "an", "and",
+        "or", "of", "to", "in", "on", "for", "with", "does",
+        "do", "can", "could", "explain", "tell", "me", "about",
+        "please", "describe", "define", "give", "show", "from",
+        "this", "that", "it", "its", "be", "by", "as"
+    }
+
+    def words(text: str) -> set[str]:
+        return set(re.findall(r"\b[a-zA-Z0-9]+\b", text.lower()))
+
+    question_words = words(question) - stop_words
+    candidates = []
+
+    for passage in passages:
+        text = passage.get("text", "")
+
+        sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+
+        for sentence in sentences:
+            sentence = sentence.strip()
+
+            if not sentence:
+                continue
+
+            sentence_words = words(sentence)
+            overlap = len(question_words & sentence_words)
+
+            relevance = (
+                overlap / len(question_words)
+                if question_words
+                else 0
+            )
+
+            candidates.append({
+                "text": sentence,
+                "page": passage.get("page", "?"),
+                "overlap": overlap,
+                "relevance": relevance,
+                "passage_score": passage.get("score", 0),
+            })
+
+    candidates.sort(
+        key=lambda item: (
+            item["relevance"],
+            item["passage_score"],
+        ),
+        reverse=True,
+    )
+
+    selected = [
+        item for item in candidates
+        if item["overlap"] > 0
+    ][:3]
+
+    if selected:
+        return "\n\n".join(
+            f"{item['text']} (Page {item['page']})"
+            for item in selected
+        )
+
+    best = passages[0]
+
+    return (
+        "I couldn't determine an exact answer using local extraction. "
+        f"The closest retrieved passage is from page "
+        f"{best.get('page', '?')}:\n\n"
+        f"{best.get('text', '')}"
+    )
+
+
+def _build_prompt(question: str, passages: list[dict]) -> str:
+    """Build a grounded question-answering prompt."""
+
+    context = "\n\n".join(
+        f"[Page {item.get('page', '?')}] {item.get('text', '')}"
+        for item in passages[:4]
+    )
+
+    return f"""Answer the user's question using only the PDF passages below.
+
+Instructions:
+- Answer the exact question directly and clearly.
+- Understand the meaning of the question, not just matching keywords.
+- Use only information supported by the provided passages.
+- Never invent facts.
+- Include page references when possible.
+- If the passages do not contain the answer, say so.
+- Be concise but explain important points when needed.
+
+PDF passages:
+{context}
+
+Question: {question}
+
+Answer:"""
+
+
+def _error_summary(
+    provider: str,
+    exc: Exception,
+    api_key: str = "",
+) -> str:
+    """Create a short diagnostic without revealing the API key."""
+
+    message = str(exc)
+
+    if api_key:
+        message = message.replace(api_key, "[hidden]")
+
+    message = " ".join(message.split())[:220]
+
+    return f"{provider}: {type(exc).__name__}: {message}"
+
+
+def answer_question(
+    question: str,
+    passages: list[dict],
+) -> str:
+    """
+    Provider priority:
+    1. Groq
+    2. OpenAI
+    3. Gemini
+    4. Local extraction
+
+    The first successful AI provider returns the answer immediately.
+    """
+
+    if not passages:
+        return "I couldn't find relevant information in this PDF."
+
+    prompt = _build_prompt(question, passages)
+    failures = []
+
+    # --------------------------------------------------
+    # 1. GROQ — PRIMARY PROVIDER
+    # --------------------------------------------------
+    api_key = get_setting("GROQ_API_KEY")
+
+    if api_key:
+        try:
+            client = Groq(
+                api_key=api_key,
+                timeout=20.0,
+                max_retries=0,
+            )
+
+            response = client.chat.completions.create(
+                model=get_setting(
+                    "GROQ_MODEL",
+                    "openai/gpt-oss-20b",
+                ),
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a precise PDF question-answering "
+                            "assistant. Base every answer on the "
+                            "provided document passages."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    },
+                ],
+                max_tokens=500,
+            )
+
+            answer = response.choices[0].message.content
+
+            if answer and answer.strip():
+                return f"{answer.strip()}\n\n— Answered by Groq"
+
+            failures.append("Groq returned an empty answer.")
+
+        except Exception as exc:
+            failures.append(
+                _error_summary("Groq", exc, api_key)
+            )
+    else:
+        failures.append("Groq skipped: API key is missing.")
+
+    # --------------------------------------------------
+    # 2. OPENAI — FIRST FALLBACK
+    # --------------------------------------------------
+    api_key = get_setting("OPENAI_API_KEY")
+
+    if api_key:
+        try:
+            client = OpenAI(
+                api_key=api_key,
+                timeout=20.0,
+                max_retries=0,
+            )
+
+            response = client.chat.completions.create(
+                model=get_setting(
+                    "OPENAI_MODEL",
+                    "gpt-4o-mini",
+                ),
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a precise PDF question-answering "
+                            "assistant. Base every answer on the "
+                            "provided document passages."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    },
+                ],
+                max_tokens=500,
+            )
+
+            answer = response.choices[0].message.content
+
+            if answer and answer.strip():
+                return f"{answer.strip()}\n\n— Answered by OpenAI"
+
+            failures.append("OpenAI returned an empty answer.")
+
+        except Exception as exc:
+            failures.append(
+                _error_summary("OpenAI", exc, api_key)
+            )
+    else:
+        failures.append("OpenAI skipped: API key is missing.")
+
+    # --------------------------------------------------
+    # 3. GEMINI — SECOND FALLBACK
+    # --------------------------------------------------
+    api_key = get_setting("GEMINI_API_KEY")
+
+    if api_key:
+        try:
+            client = genai.Client(
+                api_key=api_key,
+                http_options={"timeout": 20000},
+            )
+
+            response = client.models.generate_content(
+                model=get_setting(
+                    "GEMINI_MODEL",
+                    "gemini-2.5-flash",
+                ),
+                contents=prompt,
+                config={"max_output_tokens": 500},
+            )
+
+            answer = response.text
+
+            if answer and answer.strip():
+                return f"{answer.strip()}\n\n— Answered by Gemini"
+
+            failures.append("Gemini returned an empty answer.")
+
+        except Exception as exc:
+            failures.append(
+                _error_summary("Gemini", exc, api_key)
+            )
+    else:
+        failures.append("Gemini skipped: API key is missing.")
+
+    # --------------------------------------------------
+    # 4. LOCAL FALLBACK — NO AI API REQUIRED
+    # --------------------------------------------------
+    local_result = quick_answer(question, passages)
+
+    return (
+        f"{local_result}\n\n"
+        "---\n"
+        "**Local fallback used:** All configured AI providers "
+        "failed or were unavailable.\n\n"
+        "**Provider diagnostics:**\n"
+        + "\n".join(f"- {failure}" for failure in failures)
+    )
